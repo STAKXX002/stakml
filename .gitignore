@@ -1,6 +1,8 @@
 # Build artifacts
 build/
 
+prequel/
+
 # CMake generated files
 CMakeCache.txt
 CMakeFiles/
