@@ -33,10 +33,24 @@ target_link_libraries(bench stakml)
 add_executable(test_opts tests/test_opts.cpp)
 target_link_libraries(test_opts stakml)
 
+add_executable(test_backward tests/test_backward.cpp)
+target_link_libraries(test_backward stakml)
+
+add_executable(test_loss tests/test_loss.cpp)
+target_link_libraries(test_loss stakml)
+
+add_executable(test_optim tests/test_optim.cpp)
+target_link_libraries(test_optim stakml)
+
+add_executable(stress_test tests/stress_test.cpp)
+target_link_libraries(stress_test stakml)
+
 # ── Examples ─────────────────────────────────────────────────────────────────
-# add_executable(mnist_mlp examples/mnist_mlp.cpp)j
-# target_link_libraries(mnist_mlp stakml)
-# (uncomment in week 4
+add_executable(mnist_mlp examples/mnist_mlp.cpp)
+target_link_libraries(mnist_mlp stakml)
+
+add_executable(demo_visual examples/demo_visual.cpp)
+target_link_libraries(demo_visual stakml)
 # ── Convenience target ───────────────────────────────────────────────────────
 add_custom_target(run_tests
     COMMAND ./test_tensor
