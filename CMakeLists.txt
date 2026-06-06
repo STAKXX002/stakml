@@ -14,7 +14,7 @@ endif()
 find_package(OpenMP REQUIRED)
 
 # Compiler flags
-set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -Wall -Wextra -fsanitize=address,undefined")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra -fsanitize=address,undefined")
 # ── MODIFIED: Added -ffast-math to the global release flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -ffast-math")
 
@@ -76,7 +76,6 @@ target_link_libraries(full_tournament stakml)
 
 add_executable(cifar_cnn examples/cifar_cnn.cpp)
 target_link_libraries(cifar_cnn stakml)
-target_compile_options(cifar_cnn PRIVATE -O3 -march=native -ffast-math)
 
 # ── Convenience target ───────────────────────────────────────────────────────
 add_custom_target(run_tests
