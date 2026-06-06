@@ -44,7 +44,8 @@ int main() {
     });
 
     // 3. Initialize Optimizer (Learning Rate = 0.1)
-    optim::SGD opt(model.parameters(), 0.1f);
+    //optim::SGD opt(model.parameters(), 0.1f);
+    optim::Adam opt(model.parameters(), 1e-3f);
 
     // 4. Hyperparameters
     size_t batch_size = 128;
