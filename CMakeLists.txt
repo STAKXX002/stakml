@@ -10,15 +10,22 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
+# ── NEW: Find OpenMP ─────────────────────────────────────────────────────────
+find_package(OpenMP REQUIRED)
+
 # Compiler flags
 set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -Wall -Wextra -fsanitize=address,undefined")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
+# ── MODIFIED: Added -ffast-math to the global release flags
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -ffast-math")
 
 # ── Library ──────────────────────────────────────────────────────────────────
 add_library(stakml
     src/tensor.cpp
 )
 target_include_directories(stakml PUBLIC include)
+
+# ── NEW: Link OpenMP to your core library ────────────────────────────────────
+target_link_libraries(stakml PUBLIC OpenMP::OpenMP_CXX)
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 add_executable(test_tensor tests/test_tensor.cpp)
@@ -45,12 +52,32 @@ target_link_libraries(test_optim stakml)
 add_executable(stress_test tests/stress_test.cpp)
 target_link_libraries(stress_test stakml)
 
+add_executable(test_conv tests/test_conv.cpp)
+target_link_libraries(test_conv stakml)
+
 # ── Examples ─────────────────────────────────────────────────────────────────
 add_executable(mnist_mlp examples/mnist_mlp.cpp)
 target_link_libraries(mnist_mlp stakml)
 
 add_executable(demo_visual examples/demo_visual.cpp)
 target_link_libraries(demo_visual stakml)
+
+add_executable(world_cup examples/world_cup.cpp)
+target_link_libraries(world_cup stakml)
+
+add_executable(predict_match examples/predict_match.cpp)
+target_link_libraries(predict_match stakml)
+
+add_executable(group_stage examples/group_stage.cpp)
+target_link_libraries(group_stage stakml)
+
+add_executable(full_tournament examples/full_tournament.cpp)
+target_link_libraries(full_tournament stakml)
+
+add_executable(cifar_cnn examples/cifar_cnn.cpp)
+target_link_libraries(cifar_cnn stakml)
+target_compile_options(cifar_cnn PRIVATE -O3 -march=native -ffast-math)
+
 # ── Convenience target ───────────────────────────────────────────────────────
 add_custom_target(run_tests
     COMMAND ./test_tensor
