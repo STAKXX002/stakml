@@ -13,6 +13,14 @@
 #include <iomanip>
 #include <unordered_set>
 
+// ── CUDA backend (opt-in) ─────────────────────────────────────────────────────
+// Define STAKML_CUDA at compile time to swap the three matmul implementations
+// from the OpenMP blocked loop to cuBLAS calls.
+// Everything else (autograd, layers, loss, optimizer) is completely untouched.
+#ifdef STAKML_CUDA
+#include "cuda_matmul.cuh"
+#endif
+
 namespace stakml {
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -277,9 +285,9 @@ public:
     // CONCEPT: C[i][j] = sum_k( A[i][k] * B[k][j] )
     // Shape rule: (M×K) @ (K×N) → (M×N)
     //
-    // This naive O(M*K*N) triple loop is intentionally simple.
-    // You'll feel the pain on large matrices — that's the lesson.
-    // We'll plug in BLAS later if needed.
+    // Two backends selected at compile time via #ifdef STAKML_CUDA:
+    //   CPU: blocked OpenMP loop (your existing code, untouched)
+    //   GPU: cuBLAS SGEMM via cuda_matmul.cuh
     // ─────────────────────────────────────────────────────────────────────────
 
     Tensor matmul(const Tensor& other) const {
@@ -288,44 +296,39 @@ public:
         if (shape_[1] != other.shape_[0])
             throw std::runtime_error("matmul: inner dimensions must match");
 
-    size_t M = shape_[0], K = shape_[1], N = other.shape_[1];
-    Tensor result({M, N}, 0.0f);
+        size_t M = shape_[0], K = shape_[1], N = other.shape_[1];
+        Tensor result({M, N}, 0.0f);
 
-    const float* A = raw_ptr();
-    const float* B = other.raw_ptr();
-    float* C = result.raw_ptr();
+#ifdef STAKML_CUDA
+        cublas_matmul(raw_ptr(), other.raw_ptr(), result.raw_ptr(), M, K, N);
+#else
+        const float* A = raw_ptr();
+        const float* B = other.raw_ptr();
+        float* C = result.raw_ptr();
 
-    // 64 is a safe default for L1 cache blocking. You can tune this (e.g., 32, 128).
-    const size_t BLOCK = 64; 
+        const size_t BLOCK = 64;
 
-    #pragma omp parallel for schedule(static) collapse(2)
-    for (size_t i = 0; i < M; i += BLOCK) {
-        for (size_t j = 0; j < N; j += BLOCK) {
-            for (size_t k = 0; k < K; k += BLOCK) {
-                
-                // Calculate block boundaries
-                size_t i_end = std::min(i + BLOCK, M);
-                size_t j_end = std::min(j + BLOCK, N);
-                size_t k_end = std::min(k + BLOCK, K);
-                
-                // Standard i-k-j loop constrained strictly inside the cache block
-                for (size_t ii = i; ii < i_end; ++ii) {
-                    for (size_t kk = k; kk < k_end; ++kk) {
-                        float a_ik = A[ii*K + kk];
-                        
-                        // Let the compiler auto-vectorize this innermost loop
-                        #pragma omp simd
-                        for (size_t jj = j; jj < j_end; ++jj) {
-                            C[ii*N + jj] += a_ik * B[kk*N + jj];
+        #pragma omp parallel for schedule(static) collapse(2)
+        for (size_t i = 0; i < M; i += BLOCK) {
+            for (size_t j = 0; j < N; j += BLOCK) {
+                for (size_t k = 0; k < K; k += BLOCK) {
+                    size_t i_end = std::min(i + BLOCK, M);
+                    size_t j_end = std::min(j + BLOCK, N);
+                    size_t k_end = std::min(k + BLOCK, K);
+                    for (size_t ii = i; ii < i_end; ++ii) {
+                        for (size_t kk = k; kk < k_end; ++kk) {
+                            float a_ik = A[ii*K + kk];
+                            #pragma omp simd
+                            for (size_t jj = j; jj < j_end; ++jj) {
+                                C[ii*N + jj] += a_ik * B[kk*N + jj];
+                            }
                         }
                     }
                 }
             }
         }
-    }
-
-    return result;
-    
+#endif
+        return result;
     }
 
     // ── Transposed matmul helpers (used in autograd) ──────────────────────────
@@ -333,17 +336,9 @@ public:
     // matmul_A_BT: this @ B.T
     //   this: {M,K},  B: {N,K}  →  result: {M,N}
     //
-    // Strategy: transpose B into a fresh {K,N} buffer (one memcpy-style loop),
-    // then run the standard i-k-j matmul which has perfect cache behaviour on
-    // both A (row stride K) and BT (row stride N).
-    // This beats a fused no-copy loop because the B transposition (~100KB for
-    // the 784×128 weight) fits in L2 and the subsequent matmul streams it
-    // sequentially — no stride-K scatter writes.
-    //
     // Used in backward: dA = dC @ W.T   where dC:{batch,out}, W:{in,out}
     //
     Tensor matmul_A_BT(const Tensor& B) const {
-        // this:{M,K}, B:{N,K} → {M,N}
         if (ndim() != 2 || B.ndim() != 2)
             throw std::runtime_error("matmul_A_BT: both tensors must be 2-D");
         if (shape_[1] != B.shape_[1])
@@ -352,6 +347,9 @@ public:
         size_t M = shape_[0], K = shape_[1], N = B.shape_[0];
         Tensor result({M, N}, 0.0f);
 
+#ifdef STAKML_CUDA
+        cublas_matmul_A_BT(raw_ptr(), B.raw_ptr(), result.raw_ptr(), M, K, N);
+#else
         const float* a = raw_ptr();
         const float* b = B.raw_ptr();
         float* c = result.raw_ptr();
@@ -362,18 +360,14 @@ public:
         for (size_t i = 0; i < M; i += BLOCK) {
             for (size_t j = 0; j < N; j += BLOCK) {
                 for (size_t k = 0; k < K; k += BLOCK) {
-                    
                     size_t i_end = std::min(i + BLOCK, M);
                     size_t j_end = std::min(j + BLOCK, N);
                     size_t k_end = std::min(k + BLOCK, K);
-                    
                     for (size_t ii = i; ii < i_end; ++ii) {
                         for (size_t kk = k; kk < k_end; ++kk) {
                             float a_ik = a[ii*K + kk];
-                            
                             #pragma omp simd
                             for (size_t jj = j; jj < j_end; ++jj) {
-                                // Notice how we read b[jj*K + kk] instead of a transposed matrix!
                                 c[ii*N + jj] += a_ik * b[jj*K + kk];
                             }
                         }
@@ -381,6 +375,7 @@ public:
                 }
             }
         }
+#endif
         return result;
     }
 
@@ -388,13 +383,8 @@ public:
     //   this: {M,K},  B: {M,N}  →  result: {K,N}
     //
     // Used in backward: dW = X.T @ dC   where X:{batch,in}, dC:{batch,out}
-    // M=batch is small (32), K=in (784), N=out (128).
-    // The i-k-j loop over k-m-n keeps C[k,n] writes sequential and
-    // B[m,n] reads sequential (streaming), which is already well-behaved
-    // for small M.
     //
     Tensor matmul_AT_B(const Tensor& B) const {
-        // this:{M,K}, B:{M,N} → {K,N}
         if (ndim() != 2 || B.ndim() != 2)
             throw std::runtime_error("matmul_AT_B: both tensors must be 2-D");
         if (shape_[0] != B.shape_[0])
@@ -403,27 +393,25 @@ public:
         size_t M = shape_[0], K = shape_[1], N = B.shape_[1];
         Tensor result({K, N}, 0.0f);
 
+#ifdef STAKML_CUDA
+        cublas_matmul_AT_B(raw_ptr(), B.raw_ptr(), result.raw_ptr(), M, K, N);
+#else
         const float* a = raw_ptr();
         const float* b = B.raw_ptr();
         float*       c = result.raw_ptr();
 
         const size_t BLOCK = 64;
 
-        // Loop order adjusted for AT_B cache friendliness
         #pragma omp parallel for schedule(static) collapse(2)
         for (size_t k = 0; k < K; k += BLOCK) {
             for (size_t n = 0; n < N; n += BLOCK) {
                 for (size_t m = 0; m < M; m += BLOCK) {
-                    
                     size_t k_end = std::min(k + BLOCK, K);
                     size_t n_end = std::min(n + BLOCK, N);
                     size_t m_end = std::min(m + BLOCK, M);
-                    
                     for (size_t mm = m; mm < m_end; ++mm) {
                         for (size_t kk = k; kk < k_end; ++kk) {
-                            // a is conceptually transposed, so we read a[mm*K + kk]
                             float a_mk = a[mm*K + kk];
-                            
                             #pragma omp simd
                             for (size_t nn = n; nn < n_end; ++nn) {
                                 c[kk*N + nn] += a_mk * b[mm*N + nn];
@@ -433,7 +421,7 @@ public:
                 }
             }
         }
-
+#endif
         return result;
     }
 
@@ -465,26 +453,18 @@ public:
             throw std::runtime_error("sum: axis out of range");
 
         // ── Fast path: 2-D contiguous (the only case used in practice) ──────────
-        // sum(0): collapse rows → result shape {cols}
-        //   result[j] = sum over i of input[i*cols + j]
-        // sum(1): collapse cols → result shape {rows}
-        //   result[i] = sum over j of input[i*cols + j]
-        //
-        // No index vectors, no heap allocs, no bounds checks — just pointer math.
         if (ndim() == 2 && is_contiguous()) {
             size_t rows = shape_[0], cols = shape_[1];
             const float* src = raw_ptr();
 
             if (axis == 0) {
-                // sum over rows → shape {cols}
                 Tensor result({cols}, 0.0f);
                 float* dst = result.raw_ptr();
                 for (size_t i = 0; i < rows; ++i)
                     for (size_t j = 0; j < cols; ++j)
                         dst[j] += src[i*cols + j];
                 return result;
-            } else {  // axis == 1
-                // sum over cols → shape {rows}
+            } else {
                 Tensor result({rows}, 0.0f);
                 float* dst = result.raw_ptr();
                 for (size_t i = 0; i < rows; ++i) {
@@ -497,7 +477,7 @@ public:
             }
         }
 
-        // ── General path: N-D (keep for correctness, not performance) ───────────
+        // ── General path: N-D ────────────────────────────────────────────────────
         std::vector<size_t> out_shape;
         for (size_t i = 0; i < ndim(); ++i)
             if (i != axis) out_shape.push_back(shape_[i]);
@@ -550,26 +530,23 @@ public:
         Tensor result(shape_);
         size_t rows = shape_[0], cols = shape_[1];
 
-        const float* src = raw_ptr();      // ← read from here
-        float*       dst = result.raw_ptr(); // ← write to here
+        const float* src = raw_ptr();
+        float*       dst = result.raw_ptr();
 
         for (size_t i = 0; i < rows; ++i) {
             const float* row_src = src + i*cols;
             float*       row_dst = dst + i*cols;
 
-            // find max in this row (numerical stability)
             float max_val = row_src[0];
             for (size_t j = 1; j < cols; ++j)
                 max_val = std::max(max_val, row_src[j]);
 
-            // exp(x - max) and accumulate sum
             float sum_exp = 0.0f;
             for (size_t j = 0; j < cols; ++j) {
                 row_dst[j] = std::exp(row_src[j] - max_val);
                 sum_exp += row_dst[j];
             }
 
-            // normalize
             float inv_sum = 1.0f / sum_exp;
             for (size_t j = 0; j < cols; ++j)
                 row_dst[j] *= inv_sum;
@@ -602,8 +579,6 @@ public:
     // std = sqrt(2 / (fan_in + fan_out))
     static Tensor xavier(const std::vector<size_t>& shape) {
         if (shape.size() < 2) throw std::runtime_error("xavier: need at least 2 dims");
-        // 2D {in, out}:            fan_in=shape[0],          fan_out=shape[1]
-        // 4D {out_ch,in_ch,kH,kW}: fan_in=shape[1]*kH*kW,   fan_out=shape[0]*kH*kW
         size_t receptive = 1;
         for (size_t i = 2; i < shape.size(); ++i) receptive *= shape[i];
         float fan_in  = static_cast<float>(shape[1] * receptive);
@@ -647,7 +622,6 @@ public:
             std::cout << ")\n";
             return;
         }
-        // Higher dims: just show flat
         std::cout << "[...] (ndim=" << ndim() << ", elems=" << num_elements() << "))\n";
     }
 
@@ -661,7 +635,7 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Gradient helpers (stubs for Week 3)
+    // Gradient helpers
     // ─────────────────────────────────────────────────────────────────────────
 
     void zero_grad() {
@@ -677,16 +651,6 @@ public:
     }
 
     void backward() {
-        // Seed the output gradient.
-        // Default: dL/dL = 1 (all-ones), used when calling backward() on a
-        // scalar loss computed directly (e.g. out.sum().backward()).
-        //
-        // Exception: if grad_ already contains non-trivial values, keep them.
-        // This allows nll_loss (and other external loss functions) to pre-seed
-        // dL/d(log_probs) before calling backward(), so the correct upstream
-        // gradient propagates through log_softmax rather than all-ones.
-        //
-        // Rule: only write the all-ones seed if grad_ is null OR all zeros.
         bool needs_seed = true;
         if (grad_) {
             const float* gp = grad_->raw_ptr();
@@ -698,7 +662,6 @@ public:
         if (needs_seed)
             grad() = Tensor(shape_, 1.0f);
 
-        // DFS to build topological order
         std::vector<Tensor*> topo;
         std::unordered_set<Tensor*> visited;
 
@@ -711,7 +674,6 @@ public:
         };
         build_topo(this);
 
-        // topo is leaves-first, so reverse gives loss-first (correct backward order)
         std::reverse(topo.begin(), topo.end());
 
         for (Tensor* t : topo)
@@ -723,8 +685,6 @@ private:
     // Internal helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Compute row-major strides for a given shape
-    // e.g. shape {2,3,4} → strides {12, 4, 1}
     static std::vector<size_t> compute_strides(const std::vector<size_t>& shape) {
         if (shape.empty()) return {};
         std::vector<size_t> strides(shape.size());
@@ -734,7 +694,6 @@ private:
         return strides;
     }
 
-    // Convert multi-dim index → flat index in data_
     size_t flat_index(const std::vector<size_t>& idx) const {
         if (idx.size() != shape_.size())
             throw std::runtime_error("Index dimensionality mismatch");
@@ -747,7 +706,6 @@ private:
         return flat;
     }
 
-    // Convert flat index → multi-dim index (inverse of flat_index for contiguous)
     static std::vector<size_t> unravel_index(size_t flat, const std::vector<size_t>& shape) {
         std::vector<size_t> idx(shape.size());
         for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
